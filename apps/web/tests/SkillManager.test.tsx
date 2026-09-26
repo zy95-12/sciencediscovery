@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { createTest } from "../../../test/support/tagged/compat.mjs";
+const { test } = createTest(import.meta.url, { tags: ["category:ut", "os:linux", "arch:amd64", "arch:arm64"] });
 import assert from "node:assert/strict";
-import test from "node:test";
+
 
 import type { SkillDescriptor, SkillLibraryUpdateProposal } from "@sciencediscovery/schema";
 import { createElement } from "react";
@@ -273,6 +275,38 @@ test("renders skill library cards with pinned head version metadata", async () =
   assert.ok(cancel);
   await act(async () => cancel.props.onClick());
   assert.equal(renderer!.root.findAllByProps({ className: "skill-library-create" }).length, 0);
+  await act(async () => renderer!.unmount());
+});
+
+test("library summary counts pending proposals across libraries", async () => {
+  const client = {
+    listSkillLibraries: async () => [
+      { createdAt: "2026-01-01", id: "first", name: "First", updatedAt: "2026-01-01" },
+      { createdAt: "2026-01-01", id: "second", name: "Second", updatedAt: "2026-01-01" },
+    ],
+    listSkillLibraryVersions: async () => [],
+    listSkillLibraryProposals: async (): Promise<SkillLibraryUpdateProposal[]> => [{
+      createdAt: "2026-01-03", id: "proposal-second", libraryId: "second", rationale: "Pending",
+      request: { author: { kind: "self-evolution" }, dryRun: true, operations: [] },
+      result: { conflicts: [], diagnostics: [], diff: { added: [], deleted: [], modified: [] }, dryRun: true },
+      sourceRefs: [], status: "pending", updatedAt: "2026-01-03",
+    }],
+  } as Partial<ApiClient> as ApiClient;
+  let renderer: ReactTestRenderer | undefined;
+  await act(async () => {
+    renderer = create(createElement(SkillManager, {
+      client, initialView: "libraries", onCatalogChange: () => undefined,
+      onError: (reason) => assert.fail(String(reason)), skills: [skill],
+    }));
+  });
+  await act(async () => undefined);
+
+  const summary = renderer!.root.findByProps({ "aria-label": "Skill library summary" });
+  const proposalStat = summary.findAllByType("span").find((span) =>
+    span.findAllByType("small").some((small) => small.children.join("") === "Proposals"));
+  assert.ok(proposalStat);
+  assert.equal(proposalStat.findByType("strong").children.join(""), "1");
+  assert.equal(renderer!.root.findAllByProps({ className: "skill-library-proposal" }).length, 0);
   await act(async () => renderer!.unmount());
 });
 

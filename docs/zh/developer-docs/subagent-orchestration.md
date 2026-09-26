@@ -4,23 +4,34 @@
 
 ## 1. 总体模型
 
-ScienceDiscovery 采用 **一个 AgentRun 一个原生 loop** 的模型：主 Agent 和每个子 Agent 各自是一次独立的 `NativeAgent.execute()`，都跑在同一个 Node 控制面进程里。
+ScienceDiscovery 默认由平台的 `task` 工具分发子任务，每个子任务创建独立的 AgentRun。
+执行器与分发方式是两个不同的选择：使用 JiuwenSwarm 执行器时，主 Agent 和平台分发的子 Agent
+都由 Swarm 执行；使用内置执行器时，则运行 Node 原生 loop。
 
 ```text
-主 Agent 的 AgentRun（native loop）
-        │
-        │ 模型调用 task 工具
+主 Agent（Swarm 执行）
+        │ task
         ▼
-services/api 的 task 工具处理器
+平台创建、治理子 AgentRun
         │
-        │ 创建子 AgentRun
         ▼
-子 Agent 的 AgentRun（同样是 native loop）
-        │
+子 Agent（Swarm 执行）
         │ finalMessages + 结果摘要
         ▼
-task 工具结果回流主 Agent
+平台 task 工具将结果交回主 Agent
 ```
+
+`SCIENCE_AGENT_EXECUTOR=jiuwenswarm` 时，子任务链路配置如下（修改后重启服务）：
+
+| 环境变量 `SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS` | 行为 |
+| --- | --- |
+| 未设置、空值或 `task` | 默认：平台分发，Swarm 执行；保留平台权限、沙箱、产物交接与审计 |
+| `jiuwenswarm` | Swarm 原生 `subagent_spawn` / `subagent_wait`；不经过平台 `task` 生命周期 |
+
+未知值会在启动时被拒绝。直接启动 API 与启动脚本使用相同默认值。
+Swarm 原生模式仍需开放其原生工具（`SCIENCE_AGENT_JIUWENSWARM_TOOLS` 不设为 `ours`）。
+原生子 Agent 使用 Swarm 自身的工具与生命周期，不保证平台 task 链路的工作区、审批与溯源一致性。
+这个开关不会把执行器切回 Node 原生 loop。
 
 主 Agent 与子 Agent 之间**不共享一份可变 state**：每个 AgentRun 拥有自己的历史、自己的工具表、自己的时间预算，交接点是显式的 `finalMessages` 与结构化的 `task` 结果。权威会话历史、权限、工作区、工具实现和审计始终由 Node 控制面持有。
 
@@ -170,3 +181,11 @@ subagents/<subagentId>/
 - `services/api/src/native-agent/compaction.ts` — summary checkpoint 与历史压缩
 - `services/api/src/subagents/index.ts`、`workspace-copy.ts` — 独立 Workspace 输入交接和文件复制
 - `services/runner/src/executor.ts` — 执行 Workspace 的沙箱边界
+
+## 10. 按 Agent 隔离审计快照
+
+无论执行器是 native loop 还是 JiuwenSwarm，任务目录均由 native task 分发层管理。采集快照时显式传入会话 ID、当前请求的执行 ID，以及子任务 ID（如有）。子 Agent 只采集自身任务记录、执行溯源、通知收件箱、定时器、shell 执行和文件传输，不采集兄弟任务目录。主 Agent 采集任务目录及自身执行状态；权限、artifact 和环境记录仍属于会话共享资源。
+
+任务目录条目通过不可变的 `SubagentAuthority` 引用关联完整记录，不再内嵌轨迹。引用保留采集时的完整任务记录及继续执行所需的上下文引用。未变化的目录对象复用引用，任务或 Brief 更新后生成新版本。UI 和 native task API 仍从目录读取完整记录。历史快照继续可读，无需迁移持久化目录。
+
+本次隔离的是快照内容，不改变模型提示词或授权策略。State Pool 闭包校验仍检查引用对象，包括继续执行的历史。历史闭包遍历和其他共享资源快照的重复保存属于后续性能优化，不能仅凭此改动认定真实 E2E 超时已经修复。

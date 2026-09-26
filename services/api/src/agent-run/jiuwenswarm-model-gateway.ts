@@ -15,6 +15,8 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { recordingStage, waitForRecording } from "./recording-wait.js";
+import { recordInvalidArguments } from "./model-argument-diagnostics.js";
 
 import {
   ModelRequestError,
@@ -47,7 +49,11 @@ export interface ModelGateway {
    */
   restore<T extends Record<string, unknown>>(message: T): T;
   /** The last model turn served, for what the run's end has to say about it. */
-  lastTurn(): { text: string; toolCalls: number; truncated: boolean } | undefined;
+  lastTurn(): { text: string; toolCalls: number; truncated: boolean; recoveryAttempts?: number } | undefined;
+  lastFailure(): { requestId: string; truncated: boolean; tools: string[] } | undefined;
+  /** Payload-free metadata for active requests; never includes prompts or arguments. */
+  diagnostics(): Array<{ id: string; purpose: "task" | "auxiliary"; phase: string; elapsedMs: number;
+    upstreamChunks: number; downstreamChunks: number; upstreamIdleMs: number; downstreamIdleMs: number }>;
   close(): Promise<void>;
 }
 
@@ -55,6 +61,7 @@ type Streamer = typeof streamModelTurn;
 type HistoryMessage = Parameters<Streamer>[2][number];
 
 interface ChatRequest {
+  model?: string;
   messages?: Array<Record<string, unknown>>;
   stream?: boolean;
   tools?: Array<{ function?: { description?: string; name?: string; parameters?: unknown } }>;
@@ -111,18 +118,39 @@ const warnTrajectory = (error: unknown) => {
   console.warn(`[jiuwenswarm] could not record the model call in the trajectory: ${error instanceof Error ? error.message : String(error)}`);
 };
 
+const WITHHELD_TOOLS = "[output_limit:tool_calls_withheld] No tools from this response were executed.";
 const finishReason = (turn: ModelTurn) => turn.truncated ? "length" : turn.toolCalls.length ? "tool_calls" : "stop";
 const toolCallsOf = (turn: ModelTurn) => turn.toolCalls.map((call, index) => ({
   index, id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.args) },
 }));
 
 /**
- * Told about each model call of the run (a call with tools: a title or a summary JiuwenSwarm asks for is not one):
+ * Told about each task model call of the run (not Swarm housekeeping or compaction):
  * its exact input before it is made, the answer after. The run's trajectory is recorded from these.
  */
 export interface ModelCallObserver {
   request(input: { history: unknown[]; systemPrompt: string; tools: WireToolSpec[] }): Promise<void>;
   completed(turn: ModelTurn, history: unknown[]): Promise<void>;
+}
+
+/** Run control is independent of optional, best-effort trajectory logging. */
+export interface ModelGatewayLifecycle {
+  progress(): void;
+  /** Synchronous admission, before sending a task model request upstream. */
+  beforeTurn?(): void;
+}
+
+// The pinned Swarm forked compressor retains tool schemas for prefix caching.
+// Tool presence cannot distinguish it from task reasoning. Fail closed (count
+// the call) if a future compressor changes this explicitly recognised prompt.
+export function isSwarmCompaction(body: ChatRequest): boolean {
+  const last = body.messages?.at(-1);
+  const content = last?.content;
+  return last?.role === "user" && typeof content === "string"
+    && content.startsWith("## NON-NEGOTIABLE OUTPUT RULES")
+    && content.includes("Do NOT call any tools.")
+    && content.includes("You are an Execution State Compression Assistant.")
+    && content.includes("<coverage_check>") && content.includes("<state_snapshot>");
 }
 
 export async function startModelGateway(
@@ -131,13 +159,24 @@ export async function startModelGateway(
   signal: AbortSignal,
   streamer: Streamer = streamModelTurn,
   observer?: ModelCallObserver,
+  lifecycle?: ModelGatewayLifecycle,
 ): Promise<ModelGateway> {
   const token = randomUUID();
   const produced = new Map<string, Record<string, unknown>>();
   let last: ReturnType<ModelGateway["lastTurn"]>;
-  const remember = (turn: ModelTurn) => {
+  let lastFailure: ReturnType<ModelGateway["lastFailure"]>;
+  const active = new Map<string, () => ReturnType<ModelGateway["diagnostics"]>[number]>();
+  const remember = (turn: ModelTurn, body: ChatRequest) => {
     produced.set(turnKey(turn.assistantMessage), turn.assistantMessage);
-    last = { text: textOf(turn.assistantMessage.content), toolCalls: turn.toolCalls.length, truncated: turn.truncated === true };
+    const latest = body.messages?.at(-1);
+    const recovery = latest?.role === "user" && typeof latest.content === "string"
+      ? latest.content.match(/^\[Output limit recovery ([12])\/2;/) : null;
+    last = { text: textOf(turn.assistantMessage.content), toolCalls: turn.toolCalls.length,
+      truncated: turn.truncated === true, ...(recovery ? { recoveryAttempts: Number(recovery[1]) } : {}) };
+    if (turn.truncated) console.warn(`[output-recovery] ${JSON.stringify({ event: "model.output_limit",
+      kind: turn.toolCalls.length ? "tool_arguments" : last.text.trim() ? "partial_answer" : "reasoning_only",
+      maxTokens: policy.maxTokens, recoveryAttempts: last.recoveryAttempts ?? 0,
+      withheldToolCount: turn.toolCalls.length, usage: turn.usage })}`);
   };
   const restore: ModelGateway["restore"] = (message) => {
     const own = message.role === "assistant" ? produced.get(turnKey(message)) : undefined;
@@ -165,16 +204,67 @@ export async function startModelGateway(
       return;
     }
     const { history, systemPrompt, tools } = toModelRequest(body, restore);
-    const observed = observer && tools.length ? observer : undefined;
-    const record = async (turn: ModelTurn) => { await observed?.completed(turn, history).catch(warnTrajectory); };
+    const housekeeping = request.headers["x-sciencediscovery-model-purpose"] === "housekeeping";
+    const auxiliary = housekeeping || isSwarmCompaction(body);
+    // The legacy default-model route selects the latest active endpoint, not
+    // necessarily the owner of its housekeeping work. It cannot renew a run.
+    const progress = () => { if (!housekeeping) lifecycle?.progress(); };
+    const observed = auxiliary ? undefined : observer;
     const controller = new AbortController();
     const abort = () => controller.abort();
     signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
     response.on("close", () => { if (!response.writableEnded) controller.abort(); });
     const id = `chatcmpl-${randomUUID()}`;
+    if (!auxiliary) lastFailure = undefined;
+    const rejectInvalidArguments = (turn: ModelTurn) => {
+      // Truncated calls are withheld and returned to Swarm for bounded recovery.
+      if (turn.truncated) return;
+      const invalid = turn.toolCalls.filter(call => call.argsParseError);
+      if (!invalid.length) return;
+      if (!auxiliary) lastFailure = { requestId: id, truncated: false,
+        tools: invalid.map(call => call.name).slice(0, 20) };
+      throw new Error("Model returned invalid tool arguments");
+    };
+    const streamStarted = Date.now();
+    let upstreamChunks = 0, downstreamChunks = 0, toolArgumentChars = 0;
+    let lastUpstreamAt = streamStarted, lastDownstreamAt = streamStarted, lastLogAt = 0;
+    let phase = "preparing";
+    active.set(id, () => ({ id, purpose: auxiliary ? "auxiliary" : "task", phase,
+      elapsedMs: Date.now() - streamStarted, upstreamChunks, downstreamChunks,
+      upstreamIdleMs: Date.now() - lastUpstreamAt, downstreamIdleMs: Date.now() - lastDownstreamAt }));
+    const upstream = () => { phase = "receiving"; progress(); upstreamChunks++; lastUpstreamAt = Date.now(); };
+    const trace = (event: string, force = false) => {
+      const now = Date.now();
+      if (process.env.SCIENCE_AGENT_TRACE_MODEL_STREAM !== "1" || (!force && now - lastLogAt < 5_000)) return;
+      lastLogAt = now;
+      console.info(`[model-stream] ${JSON.stringify({ id, requestModel: body.model, phase: event,
+        elapsedMs: now - streamStarted, upstreamChunks, downstreamChunks, toolArgumentChars,
+        upstreamIdleMs: now - lastUpstreamAt, downstreamIdleMs: now - lastDownstreamAt })}`);
+    };
     const chunk = (delta: Record<string, unknown>, finish: string | null = null, extra: Record<string, unknown> = {}) =>
       `data: ${JSON.stringify({ id, object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: endpoint.model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`;
+    const observe = async (stage: "input" | "completion", operation: () => Promise<void>) => {
+      controller.signal.throwIfAborted();
+      phase = `recording_${stage}`;
+      const work = recordingStage(phase, { requestId: id }, operation, controller.signal).catch(warnTrajectory);
+      await waitForRecording(work, controller.signal);
+      controller.signal.throwIfAborted();
+    };
+    const prepare = async () => {
+      if (observed) await observe("input", () => observed.request({ history, systemPrompt, tools }));
+      controller.signal.throwIfAborted();
+      phase = "upstream_dispatched";
+      trace("upstream_dispatched", true);
+    };
+    const record = async (turn: ModelTurn) => {
+      if (observed) await observe("completion", () => observed.completed(turn, history));
+    };
     try {
+      controller.signal.throwIfAborted();
+      if (!auxiliary) { last = undefined; lifecycle?.beforeTurn?.(); }
+      // Admission listeners can abort the run when its turn budget is spent.
+      signal.throwIfAborted();
       if (body.stream) {
         // Headers wait for the first byte of the answer so that a refused request is a real HTTP error.
         let started = false;
@@ -184,33 +274,73 @@ export async function startModelGateway(
           response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
           response.write(chunk({ role: "assistant" }));
         };
-        await observed?.request({ history, systemPrompt, tools }).catch(warnTrajectory);
+        const writeDelta = (delta: Record<string, unknown>) => {
+          controller.signal.throwIfAborted();
+          progress();
+          start();
+          response.write(chunk(delta));
+          downstreamChunks++;
+          lastDownstreamAt = Date.now();
+          trace("forward");
+        };
+        trace("start", true);
+        await prepare();
+        controller.signal.throwIfAborted();
         const turn = await streamer(endpoint, systemPrompt, history, tools, policy, controller.signal, {
-          onTextDelta: (delta) => { start(); response.write(chunk({ content: delta })); },
-          onThinkingDelta: (delta) => { start(); response.write(chunk({ reasoning_content: delta })); },
+          onProgress: () => { upstream(); trace("receive"); },
+          onTextDelta: (delta) => writeDelta({ content: delta }),
+          onThinkingDelta: (delta) => writeDelta({ reasoning_content: delta }),
+          onToolCallDelta: (delta) => {
+            // Keep tool arguments behind the finish boundary: even valid JSON
+            // can be semantically incomplete when the response hits its cap.
+            controller.signal.throwIfAborted();
+            toolArgumentChars += delta.arguments.length;
+            // SSE comments are discarded by OpenAI SDKs and never reach Swarm's
+            // decoded-chunk idle watchdog. An empty delta carries real upstream
+            // progress without exposing partial arguments or adding model text.
+            writeDelta({});
+          },
         });
+        controller.signal.throwIfAborted();
+        await recordInvalidArguments(turn, id);
+        rejectInvalidArguments(turn);
         start();
-        remember(turn);
+        if (!auxiliary) remember(turn, body);
+        if (turn.truncated) {
+          if (turn.toolCalls.length) writeDelta({ content: WITHHELD_TOOLS });
+        } else {
+          for (const call of toolCallsOf(turn)) writeDelta({ tool_calls: [call] });
+        }
         await record(turn);
-        if (turn.toolCalls.length) response.write(chunk({ tool_calls: toolCallsOf(turn) }));
         const usage = usageOf(turn);
         response.write(chunk({}, finishReason(turn), usage ? { usage } : {}));
         response.end("data: [DONE]\n\n");
+        trace("complete", true);
         return;
       }
-      await observed?.request({ history, systemPrompt, tools }).catch(warnTrajectory);
-      const turn = await streamer(endpoint, systemPrompt, history, tools, policy, controller.signal);
-      remember(turn);
+      await prepare();
+      controller.signal.throwIfAborted();
+      const turn = await streamer(endpoint, systemPrompt, history, tools, policy, controller.signal, {
+        onProgress: upstream,
+        onTextDelta: progress,
+        onThinkingDelta: progress,
+        onToolCallDelta: progress,
+      });
+      controller.signal.throwIfAborted();
+      await recordInvalidArguments(turn, id);
+      rejectInvalidArguments(turn);
+      if (!auxiliary) remember(turn, body);
       await record(turn);
       const content = typeof turn.assistantMessage.content === "string" ? turn.assistantMessage.content : textOf(turn.assistantMessage.content);
       const usage = usageOf(turn);
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({
         id, object: "chat.completion", created: Math.floor(Date.now() / 1000), model: endpoint.model,
-        choices: [{ index: 0, finish_reason: finishReason(turn), message: { role: "assistant", content, ...(turn.toolCalls.length ? { tool_calls: toolCallsOf(turn).map(({ index: _index, ...call }) => call) } : {}) } }],
+        choices: [{ index: 0, finish_reason: finishReason(turn), message: { role: "assistant", content: content + (turn.truncated && turn.toolCalls.length ? WITHHELD_TOOLS : ""), ...(!turn.truncated && turn.toolCalls.length ? { tool_calls: toolCallsOf(turn).map(({ index: _index, ...call }) => call) } : {}) } }],
         ...(usage ? { usage } : {}),
       }));
     } catch (error) {
+      trace(controller.signal.aborted ? "cancelled" : "error", true);
       const status = error instanceof ModelRequestError && error.statusCode >= 400 && error.statusCode < 600 ? error.statusCode : 502;
       const message = error instanceof Error ? error.message : String(error);
       if (response.headersSent) {
@@ -221,6 +351,7 @@ export async function startModelGateway(
         fail(status, message);
       }
     } finally {
+      active.delete(id);
       signal.removeEventListener("abort", abort);
     }
   });
@@ -231,6 +362,8 @@ export async function startModelGateway(
     token,
     restore,
     lastTurn: () => last,
+    lastFailure: () => lastFailure,
+    diagnostics: () => [...active.values()].map(snapshot => snapshot()),
     close: () => new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); }),
   };
 }

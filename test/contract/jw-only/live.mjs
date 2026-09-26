@@ -259,7 +259,8 @@ const checks = {
 
   /**
    * The session's skills are JiuwenSwarm skills: imported into it (skill-creator as sciencediscovery-skill-creator, since
-   * JiuwenSwarm has its own), loaded with its skill_tool, and neither our catalog nor read_skill is offered. JiuwenSwarm
+   * JiuwenSwarm has its own), loaded with its skill_tool. Our read_skill and read_skill_resource remain available
+   * as fallbacks for JiuwenSwarm skill_tool failures, while our catalog is not duplicated. JiuwenSwarm
    * lists every skill in its prompt while they fit its budget and otherwise has the model search them (skill_index), so
    * the check loads them by name rather than looking for them in the prompt.
    */
@@ -286,8 +287,10 @@ const checks = {
       if (!outputs.some((output) => /create_evolve_run/.test(output))) throw new Error(`skill_tool did not return evolve-design's SKILL.md: ${outputs.join(" ").slice(0, 300)}`);
       if (!outputs.some((output) => /create_skill|reviewable reusable Agent Skill/.test(output))) throw new Error(`skill_tool did not return our skill-creator: ${outputs.join(" ").slice(0, 300)}`);
       const names = new Set(stub.requests.flatMap((request) => request.toolNames ?? []));
-      if ([...names].some((name) => /(^|_)read_skill(_resource)?$/.test(name))) throw new Error("read_skill is still offered");
-      console.log(`skills: ok (evolve-design and sciencediscovery-skill-creator loaded with skill_tool; no catalog or read_skill of ours; JiuwenSwarm prompt ${system.includes("newly_installed_skills") ? "in search mode" : "lists the skills"})`);
+      for (const reader of ["read_skill", "read_skill_resource"]) {
+        if (!names.has(reader)) throw new Error(`${reader} fallback is missing`);
+      }
+      console.log(`skills: ok (evolve-design and sciencediscovery-skill-creator loaded with skill_tool; fallback readers offered without a duplicate catalog; JiuwenSwarm prompt ${system.includes("newly_installed_skills") ? "in search mode" : "lists the skills"})`);
     } finally {
       await cleanup();
     }
@@ -403,10 +406,16 @@ const checks = {
       const outputs = events + JSON.stringify(streams);
       if (!outputs.includes("APPROVED-RUN")) throw new Error("the allowed command did not run");
       if (/DENIED-RUN\\n|"DENIED-RUN"/.test(JSON.stringify(streams))) throw new Error("the denied command ran");
+      // Each call JiuwenSwarm asked about is recorded once, as the user's answer to its question: the bridge-side
+      // check reuses that record by toolCallId instead of booking a second, `jiuwenswarm`-sourced one (store.ts,
+      // authorizeByJiuwenSwarm). Two questions, so exactly two records, one allowed and one denied.
       const authorizations = await api("GET", `/api/sessions/${sessionId}/permission-authorizations`);
-      const byJiuwenSwarm = authorizations.filter((authorization) => authorization.source === "jiuwenswarm");
-      if (!byJiuwenSwarm.length) throw new Error(`no authorization recorded as JiuwenSwarm's: ${JSON.stringify(authorizations).slice(0, 300)}`);
-      console.log(`approvals: ok (asked twice: "${first.summary.slice(0, 50)}"; allowed once it ran, denied it did not; ${byJiuwenSwarm.length} action(s) recorded as JiuwenSwarm's decision)`);
+      const outcomes = authorizations.map((authorization) => authorization.outcome).sort();
+      const callIds = new Set(authorizations.map((authorization) => authorization.toolCallId));
+      if (authorizations.length !== 2 || outcomes.join() !== "allowed,denied" || callIds.size !== 2 || callIds.has(undefined)) {
+        throw new Error(`expected one authorization per asked call (allowed, denied): ${JSON.stringify(authorizations).slice(0, 600)}`);
+      }
+      console.log(`approvals: ok (asked twice: "${first.summary.slice(0, 50)}"; allowed once it ran, denied it did not; one authorization per call, not double-booked)`);
     } finally {
       await cleanup();
     }

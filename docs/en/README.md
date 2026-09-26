@@ -6,35 +6,34 @@ This is the complete English documentation set.
 
 ## Getting started
 
-- [Quick start](getting-started/quick-start.md) — install, start the stack, configure a model, and complete a first agent task.
-- [Deployment](getting-started/deployment.md) — local mode, Docker, and building a single-file binary from source.
+- [Quick start](getting-started/quick-start.md) — follow the shortest Linux or macOS path, configure a model, and complete a first inspectable Agent task.
+- [Basic concepts](getting-started/concepts.md) — understand Agent loops, Tools, Skills, Specialists, Workspaces, and Artifacts.
+- [Deployment](getting-started/deployment.md) — choose a prepackaged single file, local source mode, or Docker, with long-running operation and first-run troubleshooting.
 
 ## Core capabilities
 
-- [Program evolution](core/evolve.md) — understand searches, scoring modes, engines, data splits, and result trustworthiness.
-- [Shell, environments, and workspaces](core/execution-workspaces.md) — understand execution, files, environments, completion, and stopping.
+- [Core capability overview](core/README.md) — the research capabilities ScienceDiscovery adds on top of a general Agent.
 
 ## Domain guides
 
-- [Evolve a solution](domains/evolve-a-solution.md) — run a program-evolution search end to end and judge whether the improvement is real.
-- [Literature research](domains/literature-research.md) — run an end-to-end cross-database literature survey, from service startup to approvals and results.
+- [Design an antibody on Ascend NPU](domains/antibody-design.md)
+- [Use PUCT to optimize a text compression algorithm](domains/evolve-a-solution.md) — run a program-evolution search end to end and judge whether the improvement is real.
+- [Analyze correlations and clusters of sepsis endotype scores](domains/analyze-sepsis-endotypes.md)
+- [Research how migrating birds determine location and direction](domains/literature-research.md)
 
-## How-to guides
+## Advanced setup
 
-- [Configure custom MCP servers](how-to/configure-custom-mcp.md) — local/remote connections, secret editing, OAuth, Inspector and Session tool selection.
-- [Run agent turns on JiuwenSwarm](how-to/run-with-jiuwenswarm.md) — optional, experimental executor: install a pinned JiuwenSwarm, start the stack with the adapter, and understand the expected behavior.
-- [Configure the network proxy](how-to/configure-network-proxy.md) — add a proxy on the settings page and choose a policy for LLM, web, and MCP traffic.
-- [Run an evolution search](how-to/run-an-evolution-search.md) — propose a `/evolve-design` search, size its shards, watch it run, and read the held-out result.
-- [Install Neo4j and configure ScienceMemory](how-to/science-memory-setup.md) — install an external Neo4j, enable ScienceMemory in system settings, and explore chains in the frontend graph.
+- [Create and use custom Specialists](advanced-setup/configure-specialists.md)
+- [Import and manage research Skills](advanced-setup/configure-skills.md)
+- [Configure custom MCP servers](advanced-setup/configure-custom-mcp.md)
 
 ## Reference
 
-- [Configuration](reference/configuration.md) — environment variables, default ports, upload/workspace/output quotas, and data layout.
-- [REST API](reference/rest-api.md) — internal HTTP API used by the UI: authentication, request/response, and error semantics.
-- [Runtime behavior and limits](reference/runtime-behavior.md) — models, settings inheritance, skills, permissions, timeouts, and execution limits.
-- [Built-in tools](reference/builtin-tools.md) — parameters, boundaries, and exposure conditions for model-visible tools.
-- [Web tools](reference/web-tools.md) — web search/fetch providers, configuration, permissions, caching, and audit.
-- [JiuwenSwarm migration status](reference/jiuwenswarm-migration-status.md) — implemented scope, known gaps, and hand-over guidance.
+- [CLI](reference/cli.md) — command and behavior reference for `serve`, `run`, `extract`, and `version`.
+- [Built-in research capabilities](reference/builtin-research-capabilities.md)
+- [Configuration](reference/configuration.md)
+- [REST API](reference/rest-api.md)
+- [Runtime behavior and limits](reference/runtime-behavior.md)
 
 ## Developer documentation
 

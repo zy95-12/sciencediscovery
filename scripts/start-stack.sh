@@ -18,7 +18,8 @@
 # its prebuilt image and bind-mounted runtime paths. Both modes reuse the same
 # process ordering, health waits, and shutdown handling.
 #
-# The agent loop runs on JiuwenSwarm (see docs/en/how-to/run-with-jiuwenswarm.md):
+# The agent loop runs on JiuwenSwarm in packaged and Docker deployments (see
+# docs/en/getting-started/deployment.md):
 # in local mode, install it once with `scripts/jiuwenswarm.sh setup`, then pass
 # --jiuwenswarm below.
 set -euo pipefail
@@ -26,21 +27,31 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage: ./scripts/start-stack.sh --mode local --jiuwenswarm [--no-build] [--no-node-build]
-       ./scripts/start-stack.sh --mode docker [--no-build]
+       ./scripts/start-stack.sh --mode docker [--no-jiuwenswarm] [--no-build]
 
   --mode local    read .env, optionally install/build, and use data/envs
+                  (native loop by default; --jiuwenswarm opts in)
   --mode docker   use the prebuilt image environments and container checks
+                  (JiuwenSwarm by default, since the image always bakes it
+                  in; --no-jiuwenswarm opts out)
   --no-build      skip install/build work (implicit in docker mode)
   --no-node-build skip only the Node install/build; still provision the Python
                   service environments, whose editable installs record absolute
                   paths and cannot be prepared elsewhere
-  --jiuwenswarm   run agent turns on JiuwenSwarm (local mode only): puts the
-                  adapter in front of the API (SCIENCE_AGENT_ADAPTER=1), selects
-                  the executor (SCIENCE_AGENT_EXECUTOR=jiuwenswarm) and starts
-                  the JiuwenSwarm instance if it is installed but not running.
-                  Install it once with scripts/jiuwenswarm.sh setup. See
-                  docs/en/how-to/run-with-jiuwenswarm.md. Without this flag the
-                  stack falls back to its older built-in loop.
+  --jiuwenswarm   run agent turns on JiuwenSwarm: puts the adapter in front of
+                  the API (SCIENCE_AGENT_ADAPTER=1), selects the executor
+                  (SCIENCE_AGENT_EXECUTOR=jiuwenswarm) and starts the
+                  JiuwenSwarm instance if it is not already running. In local
+                  mode, install JiuwenSwarm once with scripts/jiuwenswarm.sh
+                  setup first; the Docker image bakes it in and already
+                  defaults to it, so this flag is redundant there — first
+                  start still creates the instance under the bind-mounted
+                  data directory. See docs/en/getting-started/deployment.md.
+  --no-jiuwenswarm
+                  run agent turns on the native loop instead. Only meaningful
+                  in Docker mode, where it overrides the default; local mode
+                  is already native unless --jiuwenswarm is passed. Also
+                  settable as SCIENCE_AGENT_EXECUTOR=native.
 
 Environment:
   SCIENCE_DISCOVERY_HEALTH_TIMEOUT_SECONDS
@@ -55,6 +66,11 @@ mode_seen=0
 no_build=0
 no_node_build=0
 use_jiuwenswarm=0
+# Tracks whether the operator made a deliberate choice (flag or a
+# pre-set SCIENCE_AGENT_EXECUTOR), so the Docker-mode default below never
+# overwrites one.
+jiuwenswarm_explicit=0
+[[ -n "${SCIENCE_AGENT_EXECUTOR:-}" ]] && jiuwenswarm_explicit=1
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --mode)
@@ -89,7 +105,14 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     --jiuwenswarm)
       use_jiuwenswarm=1
+      jiuwenswarm_explicit=1
       export SCIENCE_AGENT_ADAPTER=1 SCIENCE_AGENT_EXECUTOR=jiuwenswarm
+      shift
+      ;;
+    --no-jiuwenswarm)
+      use_jiuwenswarm=0
+      jiuwenswarm_explicit=1
+      unset SCIENCE_AGENT_ADAPTER SCIENCE_AGENT_EXECUTOR
       shift
       ;;
     -h|--help)
@@ -104,15 +127,20 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-if [[ "$use_jiuwenswarm" -eq 1 && "$mode" == "docker" ]]; then
-  echo "--jiuwenswarm is available in local mode only; the Docker image does not include the adapter or JiuwenSwarm." >&2
-  exit 2
-fi
-
 if [[ "$mode" != "local" && "$mode" != "docker" ]]; then
   echo "--mode must be local or docker." >&2
   usage >&2
   exit 2
+fi
+
+# The Docker image bakes JiuwenSwarm and the adapter in unconditionally (see
+# Dockerfile), so — unlike local mode, which stays on the native loop unless
+# asked — Docker mode defaults to running on JiuwenSwarm too, the same
+# default the release binary uses. --no-jiuwenswarm (or a pre-set
+# SCIENCE_AGENT_EXECUTOR) opts back out.
+if [[ "$mode" == "docker" && "$jiuwenswarm_explicit" -eq 0 ]]; then
+  use_jiuwenswarm=1
+  export SCIENCE_AGENT_ADAPTER=1 SCIENCE_AGENT_EXECUTOR=jiuwenswarm
 fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -388,8 +416,7 @@ prepare_local() {
   # It is small (~38 MB, fastapi/uvicorn/neo4j driver/pydantic) and the
   # feature toggle now lives in System Settings → Memory graph, not env, so
   # the environment must be ready for the user to flip the switch without a
-  # rebuild. Docker mode leaves this unset because the image does not
-  # provision that service environment.
+  # rebuild. Docker bakes the same environment into the image.
   memory_graph_python="$envs_dir/memory-graph/bin/python"
   if [[ ! -x "$memory_graph_python" ]]; then
     echo "Provisioning the memory-graph Python environment..." >&2
@@ -398,8 +425,7 @@ prepare_local() {
 
   # Provision the evolve search sidecar environment. Same rationale as the
   # memory-graph one above: the feature is reached from the UI, so it must be
-  # ready without a rebuild. Docker mode leaves this unset because the image
-  # does not provision that service environment.
+  # ready without a rebuild. Docker bakes the same environment into the image.
   #
   # `--extra candidates` installs the candidate's runtime, not the sidecar's: a
   # candidate is executed with this environment's interpreter, and the AST gate
@@ -474,10 +500,38 @@ prepare_local() {
 prepare_docker() {
   local envs_root="${SCIENCE_AGENT_ENVS_ROOT:-/opt/sciencediscovery/envs}"
   gateway_python="${SCIENCE_AGENT_GATEWAY_PYTHON_PATH:-$envs_root/gateway/bin/python}"
+  memory_graph_python="${SCIENCE_AGENT_MEMORY_GRAPH_PYTHON_PATH:-$envs_root/memory-graph/bin/python}"
+  evolve_python="${SCIENCE_AGENT_EVOLVE_PYTHON_PATH:-$envs_root/evolve/bin/python}"
 
   data_dir="${SCIENCE_AGENT_DATA_DIR:-/app/data}"
   data_dir="$(absolute_from_repository "$data_dir")"
   export SCIENCE_AGENT_DATA_DIR="$data_dir"
+
+  # Opt-in front door (SCIENCE_AGENT_ADAPTER=1, set by --jiuwenswarm above):
+  # same baked-environment convention as gateway_python, the adapter's own
+  # venv the Dockerfile syncs into $envs_root/adapter.
+  if [[ "${SCIENCE_AGENT_ADAPTER:-0}" == "1" ]]; then
+    adapter_python="${SCIENCE_AGENT_ADAPTER_PYTHON_PATH:-$envs_root/adapter/bin/python}"
+    if [[ ! -x "$adapter_python" ]]; then
+      echo "The adapter Python environment is missing at $adapter_python. Rebuild the image." >&2
+      exit 1
+    fi
+  fi
+
+  # JiuwenSwarm's own venv is baked read-only under /opt (JIUWENSWARM_SRC,
+  # set by the Dockerfile); only its instance state belongs on the persisted
+  # volume, so JIUWENSWARM_ROOT points there instead of the image-relative
+  # default scripts/jiuwenswarm.sh otherwise assumes.
+  export JIUWENSWARM_ROOT="${JIUWENSWARM_ROOT:-$data_dir/jiuwenswarm}"
+
+  # Docker includes the sidecar, while the System Settings toggle still
+  # controls whether the API mirrors any application data into it.
+  export SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE="${SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE:-1}"
+
+  # Native JiuwenSwarm sub-agents do not receive ScienceDiscovery's workspace
+  # or sandbox tools. In the product image use the task bridge so specialists
+  # can actually inspect and hand back workspace results.
+  export SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS="${SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS:-task}"
 
   # A uid/gid mismatch on the host bind mount is the most common first-run
   # failure. Report it before any service starts.
@@ -507,7 +561,13 @@ EOF
     export SCIENCE_AGENT_PACKAGE_CACHE_DIR="$package_cache_dir"
   fi
 
-  if [[ -z "${HOME:-}" || ! -w "${HOME:-/}" ]]; then
+  # JiuwenSwarm creates its instance workspace under $HOME/.jiuwenswarm-instances/
+  # with no option to place it elsewhere (see scripts/jiuwenswarm.sh), so when
+  # it is in play HOME is forced onto the persisted volume even if the
+  # container's own HOME already happens to be writable: skills, permission
+  # grants and conversation state need to survive a container recreation,
+  # not just this one process.
+  if [[ -z "${HOME:-}" || ! -w "${HOME:-/}" || "${SCIENCE_AGENT_ADAPTER:-0}" == "1" ]]; then
     HOME="$data_dir/.home"
     mkdir -p "$HOME"
     export HOME
@@ -515,6 +575,14 @@ EOF
 
   if [[ ! -x "$gateway_python" ]]; then
     echo "The Python MCP server environment is missing at $gateway_python. Rebuild the image." >&2
+    exit 1
+  fi
+  if [[ ! -x "$memory_graph_python" ]]; then
+    echo "The memory-graph Python environment is missing at $memory_graph_python. Rebuild the image." >&2
+    exit 1
+  fi
+  if [[ ! -x "$evolve_python" ]]; then
+    echo "The evolve Python environment is missing at $evolve_python. Rebuild the image." >&2
     exit 1
   fi
 
@@ -545,6 +613,14 @@ EOF
 
 start_stack() {
   configure_endpoints
+  # Explicit local composition seam for integration fixtures; the normal entry
+  # point is unchanged. Never load this override in distributed Docker mode.
+  if [[ -n "${SCIENCE_AGENT_API_ENTRYPOINT:-}" ]]; then
+    [[ "$mode" == "local" && -f "$SCIENCE_AGENT_API_ENTRYPOINT" ]] || {
+      echo "SCIENCE_AGENT_API_ENTRYPOINT requires a local existing module" >&2; exit 2;
+    }
+    api_command=(node "$SCIENCE_AGENT_API_ENTRYPOINT")
+  fi
   trap cleanup EXIT INT TERM
 
   echo "Starting the sandbox runner daemon..." >&2
@@ -552,16 +628,17 @@ start_stack() {
   pids+=("$!")
   wait_healthy "runner" "$runner_url/health"
 
-  # Start the memory-graph sidecar unconditionally. The System Settings
-  # toggle gates whether the API actually mirrors reads/writes; the sidecar
-  # idles cheaply when the toggle is off and never blocks chat. The Neo4j HTTP
+  # Start the memory-graph sidecar when the feature is available. An explicit
+  # SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE=0 keeps isolated test stacks from
+  # starting the service. The System Settings toggle controls application
+  # reads and writes when the service is available. The Neo4j HTTP
   # URI below is the sidecar's pre-push default only — the API pushes the real
   # Neo4j HTTP URI/user/password (from System Settings → Memory graph) over the
   # loopback, Bearer-protected endpoint, so the plaintext credentials never
   # live in this process's env. Business events use the service's size-rotated
   # operational logger; uvicorn startup/shutdown output remains on the process
   # console.
-  if [[ -x "$memory_graph_python" ]]; then
+  if [[ "${SCIENCE_AGENT_MEMORY_GRAPH_AVAILABLE:-1}" != "0" && -x "$memory_graph_python" ]]; then
     echo "Starting the memory-graph service..." >&2
     SCIENCE_AGENT_DATA_DIR="$data_dir" \
     SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP="${SCIENCE_AGENT_MEMORY_GRAPH_NEO4J_HTTP:-http://127.0.0.1:7474}" \
@@ -588,6 +665,15 @@ start_stack() {
     if [[ -z "$adapter_python" ]]; then
       echo "SCIENCE_AGENT_EXECUTOR=jiuwenswarm needs the adapter: also set SCIENCE_AGENT_ADAPTER=1." >&2
       exit 1
+    fi
+    # Docker mode has no separate shell to run a one-time `jiuwenswarm.sh
+    # setup` in before the container ever starts (unlike local mode, which
+    # documents that as a deliberate first step): the image bakes the venv,
+    # so setup here is cheap and idempotent, and only creates this
+    # container's own instance under the bind-mounted data directory on its
+    # actual first run.
+    if [[ "$mode" == "docker" && "$use_jiuwenswarm" -eq 1 ]]; then
+      "$script_dir/jiuwenswarm.sh" setup >&2 || exit 1
     fi
     # Where the JiuwenSwarm instance listens; scripts/jiuwenswarm.sh knows its ports.
     if [[ -z "${JIUWENSWARM_GATEWAY_URL:-}" || -z "${JIUWENSWARM_MGMT_URL:-}" ]]; then
@@ -620,7 +706,8 @@ start_stack() {
     # The legacy API binds the legacy port; the adapter owns the public one. The
     # API reaches the adapter here when SCIENCE_AGENT_EXECUTOR=jiuwenswarm.
     export SCIENCE_AGENT_ADAPTER_URL="${SCIENCE_AGENT_ADAPTER_URL:-http://127.0.0.1:$public_port}"
-    api_command=(env "SCIENCE_AGENT_PORT=$legacy_port" "${api_command[@]}")
+    # The sign-in link names the port users open: the adapter's.
+    api_command=(env "SCIENCE_AGENT_PORT=$legacy_port" "SCIENCE_AGENT_PUBLIC_PORT=$public_port" "${api_command[@]}")
   fi
 
   echo "Starting the control API..." >&2

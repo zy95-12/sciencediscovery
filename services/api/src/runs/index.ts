@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import { materializeArtifact } from "../artifacts/materialize.js";
 import { randomUUID } from "node:crypto";
 import { pluginEnabled } from "@sciencediscovery/plugin-sdk";
 import { filterEnabledMcpSources } from "@sciencediscovery/mcp-sources";
@@ -29,6 +30,7 @@ import {
   buildWorkspaceSystemPrompt,
   DEFAULT_MAX_CONCURRENT_SUBAGENTS,
   DEFAULT_MAX_TOTAL_SUBAGENTS,
+  subagentFinalText,
   type WorkspaceAgentOptions,
   WORKSPACE_SYSTEM_PROMPT_VERSION,
 } from "@sciencediscovery/workspace";
@@ -37,6 +39,7 @@ import {
   createMainAgentProfile,
   createSubagentProfile,
   resolveSubagentConfig,
+  SubagentPool,
   type AgentHistoryMessage,
 } from "@sciencediscovery/orchestration";
 import { normalizeWorkspaceRelativePath, projectArtifactContent, resolveWorkspaceFile } from "@sciencediscovery/workspace";
@@ -428,6 +431,13 @@ export function emptyTrace(reason: "memory_graph_disabled" | "memory_graph_unrea
   return { startNode: null, chain: [], broken: true, truncated: false, reason };
 }
 
+/** Preserve the original research objective when ScienceMemory is enabled
+ * after a session has already begun. Runtime wake notices are not user goals. */
+export function firstUserAuthoredMessage(previousMessages: ChatMessage[], currentMessage: ChatMessage): ChatMessage | undefined {
+  return [...previousMessages, currentMessage].find((message) =>
+    message.role === "user" && (message.kind === undefined || message.kind === "message"));
+}
+
 function writeSse(response: ServerResponse, event: RunStreamEvent, sequence?: number): void {
   if (!response.destroyed && !response.writableEnded) {
     if (sequence !== undefined) response.write(`id: ${sequence}\n`);
@@ -796,6 +806,7 @@ async function executeAgentRun(
     await syncScientificEnvironmentCatalog(store, runnerClient, provenanceRecorder);
     scientificEnvironments = store.listEnvironments();
   }
+  const maxConcurrentSubagents = store.getQuotaSettings().maxConcurrentSubagents ?? DEFAULT_MAX_CONCURRENT_SUBAGENTS;
   const systemPrompt = buildWorkspaceSystemPrompt(
     runtimeSkills,
     Boolean(scientificEnvironments),
@@ -808,7 +819,7 @@ async function executeAgentRun(
       ...(enabledBuiltinSpecialists.length
         ? { builtinSpecialists: enabledBuiltinSpecialists.map((specialist) => ({ description: specialist.description, name: specialist.name })) }
         : {}),
-      subagentOrchestration: true,
+      subagentOrchestration: { maxConcurrent: maxConcurrentSubagents },
       workflowInstructions: ideaTreeLeadInstructions(settingsSnapshot.ideaTreeSettings),
     },
   );
@@ -827,17 +838,18 @@ async function executeAgentRun(
     composerReferences, body.annotationIds, deliveredNotice && !visibleContent ? "wake_notice" : "message",
     undefined, deliveredNotice);
   if (await store.getSessionRun(sessionId, runId)) await store.updateSessionRun(sessionId, runId, { userMessageId: userMessage.id });
-  // On a session's first user message, mirror a one-goal-per-session
-  // ResearchGoal (domain inferred from message keywords). Never blocks the
-  // caller; a disabled/unreachable graph is a no-op.
-  if (previousMessages.length === 0) {
+  // Re-send the session's first user-authored message on every run. The goal
+  // id is deterministic, so this also backfills sessions whose first turn
+  // occurred while ScienceMemory was disabled, without duplicating goals.
+  const goalMessage = firstUserAuthoredMessage(previousMessages, userMessage);
+  if (goalMessage) {
     memoryGraphSink.observeSessionFirstMessage({
       sessionId,
       goalId: `goal:session:${sessionId}`,
-      coreObjective: visibleContent,
-      domain: inferDomain(visibleContent),
+      coreObjective: goalMessage.content,
+      domain: inferDomain(goalMessage.content),
       topicScope: [],
-      createdAt: userMessage.createdAt,
+      createdAt: goalMessage.createdAt,
     });
   }
   const promptHistory: AgentHistoryMessage[] = previousMessages.flatMap((message) => {
@@ -1073,38 +1085,34 @@ async function executeAgentRun(
   });
   const reviewerSpecialistSettings = store.getReviewerSpecialistSettings();
   const sessionReviewerSpecialistSettings = store.getSessionReviewerSpecialistSettings(sessionId);
-  let activeSubagentCalls = 0;
+  const subagentPool = new SubagentPool(maxConcurrentSubagents);
   let launchedSubagentCalls = 0;
-  const reserveSubagentSlot = (description: string): (() => void) => {
-    if (activeSubagentCalls >= DEFAULT_MAX_CONCURRENT_SUBAGENTS) {
-      throw new Error(
-        `Subagent concurrency limit reached: at most ${DEFAULT_MAX_CONCURRENT_SUBAGENTS} task calls may run at once. `
-        + `The rejected task was "${description}". Wait for the current batch to finish before launching another batch.`,
-      );
-    }
+  const reserveSubagentSlot = async (description: string, signal: AbortSignal): Promise<() => void> => {
+    signal.throwIfAborted();
     if (launchedSubagentCalls >= DEFAULT_MAX_TOTAL_SUBAGENTS) {
       throw new Error(
         `Subagent total limit reached: at most ${DEFAULT_MAX_TOTAL_SUBAGENTS} task calls may be launched for this run. `
         + `The rejected task was "${description}". Synthesize existing results or continue directly.`,
       );
     }
-    activeSubagentCalls += 1;
     launchedSubagentCalls += 1;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      activeSubagentCalls = Math.max(0, activeSubagentCalls - 1);
-    };
+    // A notification continuation resumes an existing child without starting
+    // a main AgentRun. There is no parent deadline to pause while it queues.
+    const releaseWait = continuation ? undefined : mainExecution?.beginExternalWait();
+    try { return await subagentPool.acquire(signal); }
+    finally { releaseWait?.(); }
   };
   const createArtifactBindings = (
     workspaceRoot: string,
     turnId: string,
     sourcePathPrefix?: string,
     parentSubagentId?: string,
-  ): Pick<WorkspaceAgentOptions, "declareArtifact" | "getFileProvenance" | "listArtifacts" | "readArtifact"> => ({
+  ): Pick<WorkspaceAgentOptions, "declareArtifact" | "getFileProvenance" | "listArtifacts" | "readArtifact" | "materializeArtifact"> => ({
+    materializeArtifact: (input, signal) => materializeArtifact(store, { ...input, signal, sessionId, workspaceRoot, sourcePathPrefix, subagentId: parentSubagentId }),
     declareArtifact: async (input) => {
-      const defaultName = normalizeWorkspaceRelativePath(workspaceRoot, input.path);
+      const targetArtifact = input.artifactId ? store.getProjectArtifact(session.projectId, input.artifactId) : undefined;
+      if (input.artifactId && (!targetArtifact || targetArtifact.deletedAt)) throw new Error("Artifact not found in this Project");
+      const defaultName = targetArtifact?.logicalName ?? normalizeWorkspaceRelativePath(workspaceRoot, input.path);
       // `sourcePath` must match the artifact-derivation path stored by
       // `recordGeneratedFiles` (which normalises via `assertWorkspacePath`).
       // Passing `input.path` raw breaks that match when the LLM prefixes the
@@ -1118,6 +1126,8 @@ async function executeAgentRun(
       const normalizedInputPath = normalizeWorkspaceRelativePath(workspaceRoot, input.path);
       const sourcePath = sourcePathPrefix ? `${sourcePathPrefix}/${normalizedInputPath}` : normalizedInputPath;
       const result = await provenanceRecorder.declareWorkspaceArtifact({
+        artifactId: input.artifactId, baseVersionId: input.baseVersionId,
+        ...(input.artifactId && input.toolCallId ? { publicationId: `${turnId}:${input.toolCallId}` } : {}),
         ...(input.description ? { description: input.description } : {}),
         name: input.name?.trim() || defaultName,
         path: input.path,
@@ -1486,9 +1496,11 @@ async function executeAgentRun(
       const subagentInput: SubagentInput = specialist && input.specialistId?.trim() !== specialist.id
         ? { ...input, specialistId: specialist.id }
         : input;
-      const releaseSubagentSlot = reserveSubagentSlot(subagentInput.description);
+      const parentSignal = signal ? AbortSignal.any([signal, requestExecution.abortSignal]) : requestExecution.abortSignal;
+      const releaseSubagentSlot = await reserveSubagentSlot(subagentInput.description, parentSignal);
       let childId: string | undefined;
       try {
+        parentSignal.throwIfAborted();
         let subagent = continuation ? await store.updateSubagent(reopenSubagentForContinuation(continuation)) : await store.createSubagent(sessionId, runId, subagentInput, {
           maxTurns: subagentConfig.maxTurns,
           model: { id: selectedModel.id, model: selectedModel.model, name: selectedModel.name },
@@ -1498,7 +1510,12 @@ async function executeAgentRun(
         childId = subagent.id;
         const childController = new AbortController();
         activeSubagentAbortControllers.set(childId, childController);
-        const childSignal = AbortSignal.any([signal ?? requestExecution.abortSignal, childController.signal]);
+        // AgentRun deadlines pause while waiting on external systems. A task's
+        // timeout_seconds is instead a wall-clock budget, including MCP calls,
+        // approvals, and model/provider waits. Keep that hard deadline outside
+        // AgentRun so an unhealthy dependency cannot strand the parent task.
+        const wallClockTimeoutSignal = AbortSignal.timeout(subagentConfig.timeoutSeconds * 1_000);
+        const childSignal = AbortSignal.any([parentSignal, childController.signal, wallClockTimeoutSignal]);
         await ideaTreeRuntime?.recordSubagent(subagent.id);
         await emit({ subagent, type: "subagent.updated" });
         // Mirror the subagent's start into one scope SubTask node. objective /
@@ -1924,7 +1941,9 @@ async function executeAgentRun(
             observer: observeSubagentEvent,
             recordEvent: async (event) => { finalizeMessageStep(); activeMessageStep = undefined; await emit(event); },
             planStore: createRunPlanStore(`subagent:${subagent.id}`, () => subagent.turnCount),
-            readVersioningAuthorities: versioningAuthorities(store, sessionId, runId),
+            readVersioningAuthorities: versioningAuthorities(store, {
+              sessionId, executionId: childExecution.identity.executionId, subagentId: subagent.id,
+            }),
             runIdleTimeoutMs: timeoutSettings.gatewayIdleTimeoutMs,
             workspace: subagentWorkspace,
           },
@@ -1948,9 +1967,7 @@ async function executeAgentRun(
         } finally { contextRefs.close(); }
         subagent.contextRef = contextRef;
         childSignal.throwIfAborted();
-        assistantOutput = steps
-          .findLast((step) => step.kind === "assistant" && step.content.trim())
-          ?.content.trim() ?? "";
+        assistantOutput = subagentFinalText({ steps }) ?? "";
         if (!assistantOutput) {
           publishStep({
             content: "Subagent completed without a text response.",
@@ -1978,11 +1995,14 @@ async function executeAgentRun(
           };
         }
         } catch (error) {
-          rememberTimeout(timeoutFailure(error));
-          const failure = classifySubagentFailure(error, {
+          const failureError = wallClockTimeoutSignal.aborted
+            ? new Error(`Subagent wall-clock timeout after ${subagentConfig.timeoutSeconds} seconds`)
+            : error;
+          // Keep child failures in their own record, not the lead assistant stream.
+          const failure = classifySubagentFailure(failureError, {
             maxTurns: subagent.maxTurns,
             maxTurnsExceeded,
-            parentAborted: childSignal.aborted,
+            parentAborted: parentSignal.aborted || childController.signal.aborted,
           });
           subagent = {
             ...subagent,
@@ -2145,7 +2165,9 @@ async function executeAgentRun(
       observer: observeMainEvent,
       recordEvent: async (event) => { await emit(event); },
       planStore: createRunPlanStore("main"),
-      readVersioningAuthorities: versioningAuthorities(store, sessionId, runId),
+      readVersioningAuthorities: versioningAuthorities(store, {
+        sessionId, executionId: requestExecution.identity.executionId,
+      }),
       runIdleTimeoutMs: timeoutSettings.gatewayIdleTimeoutMs,
       workspace: agentOptions,
     },
@@ -2178,7 +2200,7 @@ async function executeAgentRun(
     assertRunActive();
     if (continuation) {
       const child = await agentOptions.runSubagent!(continuation.input, requestExecution.abortSignal);
-      const message = await store.appendMessage(sessionId, "assistant", `Subagent ${child.input.description}: ${child.steps.findLast((step) => step.kind === "assistant")?.content ?? child.error ?? child.status}`, selectedModel);
+      const message = await store.appendMessage(sessionId, "assistant", `Subagent ${child.input.description}: ${subagentFinalText(child) ?? child.error ?? child.status}`, selectedModel);
       await store.updateSessionRun(sessionId, runId, { assistantMessageId: message.id });
       await emit({ files: await listWorkspaceFiles(store, sessionId), message, type: "run.completed" });
       const outcome = continuationTurnStatus ?? child.status;

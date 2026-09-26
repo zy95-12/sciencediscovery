@@ -4,7 +4,7 @@ Python front door for the JiuwenSwarm migration (issue 84). It owns the public
 port, proxies every route it has not taken over to the legacy TypeScript API, and
 runs agent turns on JiuwenSwarm when `SCIENCE_AGENT_EXECUTOR=jiuwenswarm`.
 
-To run it, see [Run with JiuwenSwarm](../../docs/en/how-to/run-with-jiuwenswarm.md).
+To run it from source, see [Local mode](../../docs/en/getting-started/deployment.md#local-mode-host-processes).
 This file is for people working on the adapter.
 
 ## Direction
@@ -14,7 +14,7 @@ Only the **agent executor** is swapped: the legacy `createAgent` seam
 (`AgentRunBindings.createAgent`) is filled by `createJiuwenSwarmAgentFactory`
 (`services/api/src/agent-run/jiuwenswarm-agent.ts`), which calls this adapter.
 
-```
+```text
 browser ──▶ adapter :4310 ──proxy──▶ legacy API :4410 ──createAgent──┐
                 │  ▲                                                  │ POST /agent/runs
                 │  └──── tool calls (loopback bridge, per run) ◀──────┤ (NDJSON events)
@@ -37,6 +37,18 @@ A run, end to end:
    Model calls go through the proxy to the real endpoint.
 4. The adapter maps JiuwenSwarm's frames to run events (`events.py`) and streams them
    back as NDJSON; the legacy API turns them into the events the UI already renders.
+
+To investigate a four-minute gateway idle timeout, set
+`SCIENCE_AGENT_TRACE_GATEWAY_PROGRESS=1` on the Node API process before startup.
+Its `[gateway-progress]` log records a payload-free snapshot every 30 seconds:
+the session and Agent IDs, last progress type and age, and each active model
+request's purpose, elapsed time, and upstream/downstream chunk counts. A run
+deadline records the same snapshot even when the flag is off. An empty active
+request list points toward adapter or Swarm round preparation; an active request
+with no upstream chunks points toward the model transport. `[model-arguments]`
+records a request ID, tool names and truncation/usage metadata when a model
+returns malformed tool arguments. These logs omit prompts, responses, argument
+contents and credentials.
 
 Why a model proxy: JiuwenSwarm names MCP tools `mcp_<server>_<tool>`, offers the model
 dozens of tools of its own and wraps the prompt in its persona. The proxy restores the
@@ -110,7 +122,7 @@ so a run is reproducible.
 ## Configuration
 
 Choosing the backend and every variable, with defaults, is in one place:
-[Run agent turns on JiuwenSwarm](../../docs/en/how-to/run-with-jiuwenswarm.md#choose-the-backend). In short:
+[Local mode](../../docs/en/getting-started/deployment.md#local-mode-host-processes). In short:
 `./scripts/start-stack.sh --mode local --jiuwenswarm` (the same as `SCIENCE_AGENT_ADAPTER=1
 SCIENCE_AGENT_EXECUTOR=jiuwenswarm`); `GET /agent/info` on the public port says which backend runs and
 whether JiuwenSwarm answers (it takes the API's `SCIENCE_AGENT_AUTH_TOKEN`, or `SCIENCE_AGENT_ADAPTER_TOKEN`).

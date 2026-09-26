@@ -1,62 +1,140 @@
 # Quick Start
 
-This tutorial starts with a ready-to-run ScienceDiscovery executable, then configures a model and submits a first task.
+This path has one goal: get you to a first inspectable ScienceDiscovery task as quickly as possible.
 
-> See the root [README](../../../README.md) for product scope and risk boundaries, the [deployment guide](deployment.md) for complete deployment procedures, and the [configuration reference](../reference/configuration.md) for parameters and quotas.
+When you finish, you should be able to:
 
-## 1. Prepare the environment
+- open ScienceDiscovery;
+- configure a working task model;
+- make the Agent actually run a Python calculation;
+- inspect the Markdown artifact it delivers in the workspace.
 
-- Linux on `x86_64` or `aarch64`.
-- `bwrap` (Bubblewrap) for sandboxed command execution.
-- A ScienceDiscovery executable matching the host architecture.
-- At least one external model API Key.
+## 1. Start ScienceDiscovery on your system
 
-Bubblewrap must be provided by the host:
+### Linux: use the prepackaged binary
+
+For Linux on x86_64 or aarch64, this is the shortest path.
+
+You need:
+
+- an API key for a supported model provider;
+- Bubblewrap for isolated code execution.
+
+Install Bubblewrap first:
 
 ```bash
 sudo apt-get install -y bubblewrap   # Debian / Ubuntu
 # Or: sudo dnf install -y bubblewrap # Fedora / RHEL / openEuler
 ```
 
-## 2. Start ScienceDiscovery
+Then download the ScienceDiscovery executable for your architecture from the [Releases page](https://github.com/openJiuwen-ai/sciencediscovery/releases) and rename it to `ScienceDiscovery`.
 
-The following commands assume the `ScienceDiscovery` executable is in the current directory:
+From the directory containing the file, run:
 
 ```bash
 chmod +x ./ScienceDiscovery
 ./ScienceDiscovery serve
 ```
 
-`serve` starts the gateway, runner, and API/Web UI and binds them to the local machine by default. Once startup completes, `serve` prints the `Open to sign in` URL and the local service access token; open that sign-in URL in a browser to authenticate and save the local service access token automatically. (If opening <http://127.0.0.1:4310> directly, the Web UI presents a clear Connection onboarding guide where you can paste the token from the startup output and save.) Keep the sign-in URL private. The Web UI opens its Connection settings automatically whenever the token it holds is rejected. Ctrl-C stops all child services.
+### macOS: use local source mode
 
-In a second terminal, verify the API:
+Both macOS x64 and arm64 are supported. There is currently no prepackaged single-file macOS binary, so use local source mode. The sandbox uses the built-in Seatbelt mechanism; Bubblewrap is not required.
+
+Make sure the machine has:
+
+- Node.js 22.19+;
+- pnpm 11.1.2;
+- Python 3;
+- uv 0.9+;
+- Git;
+- curl;
+- an API key for a supported model provider.
+
+Then run:
 
 ```bash
-curl --fail http://127.0.0.1:4310/api/health
+git clone https://github.com/openJiuwen-ai/sciencediscovery.git
+cd sciencediscovery
+git checkout feat/jiuwenswarm
+
+scripts/jiuwenswarm.sh setup
+./scripts/start-stack.sh --mode local
 ```
 
-The top-level `status` is `ok` after a normal startup and `degraded` when the Runner is unavailable. See [REST API reference](../reference/rest-api.md#health) for field details.
+The first run installs and builds the required components, so it needs network access and takes longer than later starts.
 
-Binary packaging, source mode, and Docker are separate deployment paths; their prerequisites and complete commands are in the [deployment guide](deployment.md).
+After the project has already been built, later starts can use:
 
-## 3. Configure a task model
+```bash
+./scripts/start-stack.sh --mode local --no-build
+```
 
-Under **System configuration → Global defaults**, configure the provider base URL, model ID, and external model API Key for the task model. This is separate from the local service access token. See [Configuration reference](../reference/configuration.md) for supported environment variables and files.
+### After startup
 
-## 4. Run a first scientific task
+On both Linux and macOS, a successful startup prints an `Open to sign in` URL in the terminal. Open it in your browser to enter ScienceDiscovery.
 
-1. Create a Project and Session.
-2. Enter a focused scientific question, such as “Summarize the current research objective and propose the next analysis steps.”
-3. To analyze local material, upload a CSV or PDF that you are authorized to use and describe the analysis objective.
-4. Review and approve the permission card shown for the first code execution or external-data access.
-5. Inspect tool calls and execution results in the message timeline, and inspect generated files in the Artifact area.
+Keep the startup terminal running. Closing it or pressing Ctrl-C stops the service.
 
-Responses, tool calls, and generated artifacts depend on the configured model, enabled connectors, and supplied material; they are not fixed-output promises.
+If no sign-in URL appears, the browser cannot connect, or startup reports an error, see [first-run troubleshooting](deployment.md#first-run-troubleshooting-for-binary-and-local-mode).
 
-## 5. Next steps
+> For Docker, air-gapped environments, Linux source builds, and complete deployment details, see the [deployment guide](deployment.md).
 
-- Deployment and process operations: [Deployment guide](deployment.md)
-- Environment variables, ports, quotas, and storage paths: [Configuration reference](../reference/configuration.md)
-- Day-to-day runtime behavior: [Runtime behavior reference](../reference/runtime-behavior.md)
-- Tool parameters: [Built-in tools reference](../reference/builtin-tools.md)
-- System principles: [Overall runtime architecture](../developer-docs/architecture.md)
+## 2. Configure a model
+
+Open **System settings → Model registry**:
+
+1. choose a preset provider or add one manually;
+2. enter the provider details and API key;
+3. select **Save & connect**;
+4. confirm the connection test passes and choose a **Global default task model**.
+
+The key here is your model provider API key. If the connection test fails, first check the API key, provider URL, model ID, and network connection.
+
+## 3. Run your first scientific task
+
+Create a Project and Session, then paste the complete task below into the message box:
+
+```text
+Complete a minimal data-analysis task and deliver the result as an inspectable scientific artifact.
+
+Data:
+temperature_c,yield_g
+20,41
+22,45
+24,49
+26,52
+28,54
+30,53
+32,49
+34,43
+
+Requirements:
+1. Save the data as temperature_yield.csv.
+2. You must actually run Python for the calculations; do not estimate the numbers only in the reply.
+3. Calculate the mean yield, the temperature with the highest yield, and the Pearson correlation between temperature_c and yield_g.
+4. Briefly interpret the result and note that this small dataset alone cannot establish causality.
+5. Write the complete analysis to first-analysis.md and declare it as an artifact.
+6. In the final reply, explicitly name the artifact file.
+```
+
+If the first code execution asks for permission, review and approve the action, then let the task continue.
+
+The goal is not a sophisticated scientific conclusion. It is to verify the smallest useful ScienceDiscovery loop: **understand the task → run a tool → create files → deliver an artifact**.
+
+## 4. Confirm that it worked
+
+Your first run is successful when all four are true:
+
+- [ ] the task has finished and no longer appears as running;
+- [ ] the timeline shows an actual code execution;
+- [ ] `first-analysis.md` appears in the workspace;
+- [ ] opening the artifact shows values produced by the calculation and a short interpretation.
+
+Different models may phrase the report differently. That is expected; what matters here is that the tool actually ran and the artifact was created.
+
+## 5. Where to go next
+
+- To understand what ScienceDiscovery can do, see [Core capabilities](../README.md#core-capabilities).
+- To follow complete real research examples, see [Domain guides](../README.md#domain-guides).
+- For a concrete optimization walkthrough, see [Use PUCT to optimize a text compression algorithm](../domains/evolve-a-solution.md).
+- To use Docker, build from source, or troubleshoot startup, see the [deployment guide](deployment.md).

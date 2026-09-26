@@ -19,7 +19,7 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { mergePluginSettings } from "@sciencediscovery/plugin-sdk";
 import { PluginControl } from "./plugins/control.js";
-import { VersionStore, RefStore, workspaceHeadName, withWorkspaceMutation, withWorkspaceAdmission, withWorkspaceRetirement } from "@sciencediscovery/cas";
+import { type AgentStateRef, VersionStore, RefStore, workspaceHeadName, withWorkspaceMutation, withWorkspaceAdmission, withWorkspaceRetirement } from "@sciencediscovery/cas";
 import { dirname, relative, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AgentNotifications } from "./agent-notifications.js";
@@ -416,6 +416,9 @@ export class SessionStoreHttpError extends Error {
 
 export class SessionStore {
   readonly dataDir: string;
+  // Catalog mutations replace Subagent objects. Cache by object identity so an
+  // unchanged record is serialized once, without retaining superseded revisions.
+  private readonly subagentAuthorityRefs = new WeakMap<Subagent, Promise<AgentStateRef>>();
 
   /** File publishers share the Runner's cross-process admission and commit boundary. */
   async mutateWorkspace<T>(root: string, kind: string, operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -454,17 +457,21 @@ export class SessionStore {
    * settings became the sole entry point.
    */
   private readonly initialNeo4jPassword?: string;
+  /** Whether a data directory with no memory-graph settings yet starts with the graph on (see ServerConfig). */
+  private readonly memoryGraphAvailable: boolean;
 
   constructor(
     dataDir: string,
     initialTimeoutSettings: SystemTimeoutSettings = DEFAULT_SYSTEM_TIMEOUT_SETTINGS,
     initialQuotaSettings: SystemQuotaSettings = DEFAULT_SYSTEM_QUOTA_SETTINGS,
     initialNeo4jPassword?: string,
+    memoryGraphAvailable = true,
   ) {
     this.dataDir = resolve(dataDir);
     this.initialTimeoutSettings = initialTimeoutSettings;
     this.initialQuotaSettings = initialQuotaSettings;
     this.initialNeo4jPassword = initialNeo4jPassword?.trim() || undefined;
+    this.memoryGraphAvailable = memoryGraphAvailable;
   }
 
   get notifications(): AgentNotifications {
@@ -767,6 +774,8 @@ export class SessionStore {
       globalSettings.enabledConnectorIds = [...globalSettings.enabledConnectorIds, "web"];
     }
     const memoryGraphSettings = normalizeMemoryGraphSettings(saved.memoryGraphSettings);
+    // Seeded once, for a directory that has no setting yet: where no sidecar runs, the graph starts off.
+    if (saved.memoryGraphSettings === undefined && !this.memoryGraphAvailable) memoryGraphSettings.enabled = false;
     // Per-Runner NPU selections. Unknown shapes are dropped rather than
     // trusted: a malformed entry would otherwise reach a sandbox launch.
     const npuDeviceSelections = normalizeNpuDeviceSelections(saved.npuDeviceSelections);
@@ -2887,6 +2896,25 @@ export class SessionStore {
       .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
+  /** Immutable audit references; filter before copying or serializing trajectories. */
+  async captureSubagentAuthorities(sessionId: string, subagentId?: string) {
+    if (!this.getSession(sessionId)) throw new Error("Session not found");
+    const records = this.catalog.subagents.filter((child) => child.sessionId === sessionId
+      && (subagentId === undefined || child.id === subagentId))
+      .toSorted((left, right) => left.createdAt.localeCompare(right.createdAt));
+    if (subagentId !== undefined && records.length !== 1) throw new Error("Subagent not found in Session");
+    const versions = new VersionStore(this.dataDir);
+    return Promise.all(records.map(async (child) => {
+      let record = this.subagentAuthorityRefs.get(child);
+      if (!record) {
+        record = versions.putRecord("SubagentAuthority", JSON.parse(JSON.stringify(child)));
+        this.subagentAuthorityRefs.set(child, record);
+        void record.catch(() => this.subagentAuthorityRefs.delete(child));
+      }
+      return { id: child.id, parentTurnId: child.parentTurnId, status: child.status, record: await record };
+    }));
+  }
+
   async createSubagent(
     sessionId: string,
     parentTurnId: string,
@@ -3452,6 +3480,9 @@ export class SessionStore {
   }
 
   async createArtifactVersion(input: {
+    artifactId?: string;
+    baseVersionId?: string;
+    publicationId?: string;
     content: CasObjectRef;
     description?: string;
     executionRunIds?: string[];
@@ -3482,12 +3513,33 @@ export class SessionStore {
     if (!/^[a-f0-9]{64}$/.test(input.content.hash) || !Number.isSafeInteger(input.content.size) || input.content.size < 0) {
       throw new Error("Artifact content reference is invalid");
     }
-    const dependencies = [...new Set(input.inputArtifactVersionIds ?? [])];
+    if (!!input.artifactId !== !!input.baseVersionId) throw new Error("artifactId and baseVersionId are required together");
+    const explicit = input.artifactId ? this.catalog.artifacts.find(a =>
+      a.id === input.artifactId && a.projectId === projectId && !a.deletedAt) : undefined;
+    if (input.artifactId && !explicit) throw new Error("Artifact not found in this Project");
+    const base = input.baseVersionId ? this.catalog.artifactVersions.find(v =>
+      v.id === input.baseVersionId && v.artifactId === explicit?.id && v.projectId === projectId) : undefined;
+    if (input.baseVersionId && !base) throw new Error("Artifact base version not found");
+    if (explicit && input.publicationId) {
+      const prior = this.catalog.artifactVersions.find(v => v.artifactId === explicit.id &&
+        v.sessionId === input.sessionId && v.publicationId === input.publicationId);
+      if (prior) {
+        if (prior.baseVersionId !== input.baseVersionId || prior.content.hash !== input.content.hash || prior.content.size !== input.content.size)
+          throw new Error("ARTIFACT_PUBLICATION_CONFLICT: retry changed the published content or base version");
+        await this.saveCatalog();
+        return { artifact: structuredClone(explicit), version: structuredClone(prior) };
+      }
+    }
+    // No await between this compare and catalog mutation: one SessionStore owns
+    // the catalog; saveCatalog serializes its durable SQLite transactions.
+    if (explicit && base?.version !== explicit.currentVersion)
+      throw new Error("ARTIFACT_VERSION_CONFLICT: Artifact changed since the base version; local file preserved");
+    const dependencies = [...new Set([...(input.inputArtifactVersionIds ?? []), ...(base ? [base.id] : [])])];
     if (dependencies.some((id) => !this.catalog.artifactVersions.some((version) => version.id === id && version.projectId === projectId))) {
       throw new Error("Artifact dependency must reference a version in the same Project");
     }
     const now = new Date().toISOString();
-    let artifact = this.catalog.artifacts.find((candidate) =>
+    let artifact = explicit ?? this.catalog.artifacts.find((candidate) =>
       candidate.projectId === projectId && candidate.name === logicalName && !candidate.deletedAt);
     if (artifact && artifact.kind !== input.kind) throw new Error("Artifact kind cannot change across versions");
     if (artifact?.origin === "server_generated" && (input.origin ?? "llm_declared") !== "server_generated") {
@@ -3517,6 +3569,7 @@ export class SessionStore {
       if (input.title?.trim()) artifact.title = input.title.trim();
     }
     const version: ScientificArtifactVersion = {
+      ...(base ? { baseVersionId: base.id, ...(input.publicationId ? { publicationId: input.publicationId } : {}) } : {}),
       artifactId: artifact.id,
       content: structuredClone(input.content),
       createdAt: now,
@@ -3525,7 +3578,7 @@ export class SessionStore {
       inputArtifactVersionIds: dependencies,
       mediaType: input.mediaType,
       projectId,
-      ...(input.references?.length ? { references: structuredClone(input.references) } : {}),
+      ...((input.references ?? base?.references)?.length ? { references: structuredClone(input.references ?? base!.references!) } : {}),
       sessionId: input.sessionId,
       ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
       ...(input.turnId ? { turnId: input.turnId } : {}),
@@ -4462,6 +4515,15 @@ export class SessionStore {
   /**
    * The JiuwenSwarm backend: its permission engine already decided about the tool call (and asked the user when its
    * policy says so), so the privileged action is allowed here and recorded as JiuwenSwarm's decision.
+   *
+   * JiuwenSwarm's own ask (`chat.ask_user_question`, mapped by `requestApproval` in runs/index.ts through the usual
+   * `requestPermission`/mode-switch/decide machinery) already recorded an authorization for this same tool call
+   * before the call was ever allowed to reach this bridge-side check — this function used to always mint a second
+   * one regardless, so every JiuwenSwarm-gated call double-booked one decision as two authorization rows (caught by
+   * server.test.ts's exact-count assertions once a run made more than one gated call). Reuse that first record by
+   * `toolCallId` instead of creating a redundant one; a call whose tool was never asked about (not in
+   * `JIUWENSWARM_ASK_TOOLS`, so JiuwenSwarm allowed it without a question) has no such record and still gets one
+   * created here, as before.
    */
   async authorizeByJiuwenSwarm(
     sessionId: string,
@@ -4470,6 +4532,11 @@ export class SessionStore {
     context: { executionId?: string; toolCallId?: string } = {},
   ): Promise<{ allowed: true; authorization: PermissionAuthorization }> {
     const session = this.assertSessionWritable(sessionId);
+    if (context.toolCallId) {
+      const already = this.listPermissionAuthorizations(sessionId)
+        .find((candidate) => candidate.toolCallId === context.toolCallId);
+      if (already) return { allowed: true, authorization: already };
+    }
     const authorization = this.createPermissionAuthorization({
       action,
       ...context,
@@ -4750,6 +4817,7 @@ export class SessionStore {
         resource: request.resource,
         session,
         source: "always_allow",
+        ...(request.toolCallId ? { toolCallId: request.toolCallId } : {}),
       });
       request.permissionAuthorizationId = authorization.id;
       return authorization;

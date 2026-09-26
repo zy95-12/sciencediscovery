@@ -90,5 +90,9 @@ curl --silent --fail "http://127.0.0.1:$adapter_port/agent/info" | grep -q '"rea
 export SCIENCE_AGENT_EXECUTOR=jiuwenswarm
 export SCIENCE_AGENT_ADAPTER_URL="http://127.0.0.1:$adapter_port"
 unset SCIENCE_AGENT_ADAPTER_TOKEN
+# API fixtures exercise ScienceDiscovery's task lifecycle while Swarm executes
+# the agent turns. Keep this test choice explicit; production still supports
+# both routes. Callers can select the native route with SUBAGENTS=jiuwenswarm.
+export SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS="${SCIENCE_AGENT_JIUWENSWARM_SUBAGENTS:-task}"
 echo "Agent turns run on JiuwenSwarm (instance $JIUWENSWARM_INSTANCE) through the adapter at $SCIENCE_AGENT_ADAPTER_URL." >&2
 "$@"
