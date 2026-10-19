@@ -1,0 +1,23 @@
+[
+  {
+    "artifactContentHash": "b1974254942386f99e0cefea6b3f825050c26372f24125508bc0f87cc4308375",
+    "artifactId": "5dc880a2-2fcd-40c4-87f6-fdaa3bc3d32c",
+    "artifactLogicalName": "crispr-base-editing-scd-scan.md",
+    "artifactVersionId": "261c7de9-32a3-4b63-ba82-dd8a7bb9f591",
+    "checkpointId": "8cd7cf80-b082-40c0-afcf-5c066cccda96",
+    "checks": [
+      "citation"
+    ],
+    "createdAt": "2026-10-19T14:33:02.574Z",
+    "decision": "ACCEPT_AND_PROCEED",
+    "findings": [],
+    "finishedAt": "2026-10-19T14:33:02.646Z",
+    "id": "e27045d4-6d2a-4c79-b78a-86fccfda29b3",
+    "provenanceRefs": [],
+    "reviewerSpecialistVersion": "2.2.0-artifact-review-routing",
+    "reviewLevel": "quick",
+    "sessionId": "a11aaecd-d8ef-4517-b6a8-7c1f22992c77",
+    "status": "completed",
+    "toolCallId": "automatic-review:723361b8-4b91-454b-92f5-3c94c0b63aa7"
+  }
+]
